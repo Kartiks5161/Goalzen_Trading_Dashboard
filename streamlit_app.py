@@ -2,8 +2,9 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import os, random, time
+import os, random, time, io
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -38,14 +39,14 @@ except Exception:
 # Data sources
 import yfinance as yf
 try:
-    from nsepython import nse_fetch  # fallback source
+    from nsepython import nse_fetch  # optional fallback
 except Exception:
     nse_fetch = None
 
 # -------------------------------
 # Page config & reproducibility
 # -------------------------------
-st.set_page_config(page_title="Indian Equity Direction ML — RELIANCE", layout="wide")
+st.set_page_config(page_title="Indian Equity Direction ML — Upload CSV or Fetch", layout="wide")
 
 GLOBAL_SEED = 42
 os.environ["PYTHONHASHSEED"] = str(GLOBAL_SEED)
@@ -94,45 +95,39 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -------------------------------
-# Robust loader: Yahoo primary, NSE fallback
+# Loaders: CSV / Yahoo / NSE / Demo
 # -------------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
-@st.cache_data(show_spinner=False, ttl=3600)
-def load_ohlcv(symbol: str, years: int, uploaded_csv_bytes: bytes | None, allow_demo: bool) -> pd.DataFrame:
-    """
-    Robust Indian OHLCV loader (last N years).
-    Order: Yahoo (period→dates→history→raw) → NSE (nsepython) → Uploaded CSV → Demo (synthetic).
-    Returns: DataFrame with columns Open, High, Low, Close, Volume; index = Date (UTC-naive).
-    """
-    from datetime import datetime, timedelta
-    import io
+@st.cache_data(show_spinner=False)
+def load_from_csv(file_bytes: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # find a date column
+    date_col = None
+    for c in ["Date", "date", "DATE", "Timestamp", "timestamp"]:
+        if c in df.columns:
+            date_col = c
+            break
+    if date_col is None:
+        raise ValueError("CSV must include a 'Date' column.")
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col]).set_index(date_col).sort_index()
 
-    # ---------- Helper: clean Yahoo/NSE frames ----------
-    def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-        df = _flatten_cols(df.dropna(how="all").sort_index())
-        def pick(key, avoid=None):
-            cols = [c for c in df.columns if key in c]
-            if avoid:
-                c2 = [c for c in cols if avoid not in c]
-                if c2: return c2[0]
-            return cols[0] if cols else None
-        open_c  = pick("open"); high_c = pick("high"); low_c = pick("low")
-        close_c = pick("close", avoid="adj"); vol_c = pick("volume")
-        if close_c is None or vol_c is None:
-            raise RuntimeError("Missing close/volume columns in response.")
-        out = pd.DataFrame(index=df.index)
-        if open_c and high_c and low_c:
-            out["Open"] = pd.to_numeric(df[open_c], errors="coerce")
-            out["High"] = pd.to_numeric(df[high_c], errors="coerce")
-            out["Low"]  = pd.to_numeric(df[low_c],  errors="coerce")
-        out["Close"]  = pd.to_numeric(df[close_c], errors="coerce")
-        out["Volume"] = pd.to_numeric(df[vol_c],   errors="coerce")
-        out = out.dropna(subset=["Close", "Volume"])
-        if out.empty:
-            raise RuntimeError("Data loaded, but rows dropped during cleanup.")
-        return out
+    # normalize columns (case-insensitive)
+    lo = {c.lower(): c for c in df.columns}
+    need = ["open", "high", "low", "close", "volume"]
+    missing = [c for c in need if c not in lo]
+    if missing:
+        raise ValueError(f"CSV missing columns: {missing}. Expected: {need}")
 
-    # ---------- Helper: try-with-backoff ----------
+    out = df[[lo["open"], lo["high"], lo["low"], lo["close"], lo["volume"]]].copy()
+    out.columns = ["Open", "High", "Low", "Close", "Volume"]
+    out = out.apply(pd.to_numeric, errors="coerce").dropna()
+    if out.empty:
+        raise ValueError("CSV parsed but became empty after cleanup.")
+    return out
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_online(symbol: str, years: int) -> Optional[pd.DataFrame]:
+    """Try Yahoo→NSE. Return DataFrame or None on failure (no exceptions)."""
     def _try(fn, attempts=2):
         for k in range(attempts):
             try:
@@ -140,14 +135,12 @@ def load_ohlcv(symbol: str, years: int, uploaded_csv_bytes: bytes | None, allow_
                 if df is not None and len(df) > 0:
                     return df
             except Exception as e:
-                # Fast-fail on these Yahoo-specific errors
                 msg = str(e)
                 if any(s in msg for s in ["JSONDecodeError", "Expecting value", "No timezone found", "YFTzMissingError"]):
                     break
             time.sleep(0.5 * (k + 1))
         return None
 
-    # ---------- A) Online sources ----------
     raw = (symbol or "").strip()
     t = raw.upper() if raw else "RELIANCE"
     if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
@@ -156,116 +149,78 @@ def load_ohlcv(symbol: str, years: int, uploaded_csv_bytes: bytes | None, allow_
     start = (datetime.utcnow() - timedelta(days=365 * years + 30)).date().isoformat()
     end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
 
-    # A1) Yahoo Finance (period)
+    # Yahoo
     df = _try(lambda: yf.download(t, period=f"{years}y", interval="1d",
                                   auto_adjust=False, progress=False, threads=False))
-    # A2) Yahoo (explicit dates)
     if df is None:
         df = _try(lambda: yf.download(t, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
-    # A3) Yahoo Ticker.history
     if df is None:
         tk = yf.Ticker(t)
         df = _try(lambda: tk.history(start=start, end=end, interval="1d", auto_adjust=False))
-    # A4) Yahoo raw symbol (no .NS)
     if df is None and t != raw:
         df = _try(lambda: yf.download(raw, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
+
     if df is not None and len(df) > 0:
         try:
             return _clean_ohlcv(df)
         except Exception:
-            pass  # fallthrough
+            pass
 
-    # A5) NSE fallback (nsepython)
+    # NSE fallback
     try:
-        from nsepython import nse_fetch
-        sym = raw.replace(".NS", "").upper() or "RELIANCE"
-        start_dt = (datetime.utcnow() - timedelta(days=365 * years + 5))
-        end_dt   = datetime.utcnow()
-        url = (
-            "https://www.nseindia.com/api/historical/cm/equity"
-            f"?symbol={sym}&series=[%22EQ%22]"
-            f"&from={start_dt.strftime('%d-%m-%Y')}"
-            f"&to={end_dt.strftime('%d-%m-%Y')}"
-        )
-        nse_df = nse_fetch(url)
-        if nse_df is not None and len(nse_df) > 0:
-            rename_map = {
-                "CH_OPENING_PRICE": "Open",
-                "CH_TRADE_HIGH_PRICE": "High",
-                "CH_TRADE_LOW_PRICE": "Low",
-                "CH_CLOSING_PRICE": "Close",
-                "CH_TOT_TRADED_QTY": "Volume",
-                "CH_TIMESTAMP": "Date",
-            }
-            for k in rename_map:
-                if k not in nse_df.columns:
-                    raise RuntimeError("NSE schema changed")
-            nse_df = nse_df.rename(columns=rename_map)
-            nse_df["Date"] = pd.to_datetime(nse_df["Date"], errors="coerce")
-            nse_df = nse_df.dropna(subset=["Date"]).set_index("Date")
-            nse_df = nse_df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
-            nse_df = nse_df.sort_index()
-            if len(nse_df) > 0:
-                return nse_df
+        if nse_fetch is not None:
+            sym = raw.replace(".NS", "").upper() or "RELIANCE"
+            start_dt = (datetime.utcnow() - timedelta(days=365 * years + 5))
+            end_dt   = datetime.utcnow()
+            url = (
+                "https://www.nseindia.com/api/historical/cm/equity"
+                f"?symbol={sym}&series=[%22EQ%22]"
+                f"&from={start_dt.strftime('%d-%m-%Y')}"
+                f"&to={end_dt.strftime('%d-%m-%Y')}"
+            )
+            nse_df = nse_fetch(url)
+            if nse_df is not None and len(nse_df) > 0:
+                rename_map = {
+                    "CH_OPENING_PRICE": "Open",
+                    "CH_TRADE_HIGH_PRICE": "High",
+                    "CH_TRADE_LOW_PRICE": "Low",
+                    "CH_CLOSING_PRICE": "Close",
+                    "CH_TOT_TRADED_QTY": "Volume",
+                    "CH_TIMESTAMP": "Date",
+                }
+                for k in rename_map:
+                    if k not in nse_df.columns:
+                        raise RuntimeError("NSE schema changed")
+                nse_df = nse_df.rename(columns=rename_map)
+                nse_df["Date"] = pd.to_datetime(nse_df["Date"], errors="coerce")
+                nse_df = nse_df.dropna(subset=["Date"]).set_index("Date")
+                nse_df = nse_df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
+                nse_df = nse_df.sort_index()
+                if len(nse_df) > 0:
+                    return nse_df
     except Exception:
         pass
 
-    # ---------- B) Uploaded CSV ----------
-    if uploaded_csv_bytes:
-        try:
-            dfu = pd.read_csv(io.BytesIO(uploaded_csv_bytes))
-            # Try common date column names
-            date_col = None
-            for cand in ["Date", "date", "DATE", "Timestamp", "timestamp"]:
-                if cand in dfu.columns:
-                    date_col = cand; break
-            if date_col is None:
-                raise ValueError("CSV must include a 'Date' column.")
-            dfu[date_col] = pd.to_datetime(dfu[date_col], errors="coerce")
-            dfu = dfu.dropna(subset=[date_col]).set_index(date_col).sort_index()
-            # Normalize column names
-            lo = {c.lower(): c for c in dfu.columns}
-            need = ["open","high","low","close","volume"]
-            missing = [c for c in need if c not in lo]
-            if missing:
-                raise ValueError(f"CSV missing columns: {missing}")
-            out = dfu[[lo["open"], lo["high"], lo["low"], lo["close"], lo["volume"]]].copy()
-            out.columns = ["Open","High","Low","Close","Volume"]
-            out = out.apply(pd.to_numeric, errors="coerce").dropna()
-            if out.empty:
-                raise ValueError("CSV parsed but empty after cleanup.")
-            st.info("Using uploaded CSV as data source.")
-            return out
-        except Exception as e:
-            st.error(f"Uploaded CSV could not be used: {e}")
+    return None
 
-    # ---------- C) Demo synthetic (always works, clearly labeled) ----------
-    if allow_demo:
-        # 2 years of business days
-        periods = 252 * years
-        rng = pd.bdate_range(end=pd.Timestamp.utcnow().normalize(), periods=periods)
-        # Geometric Brownian Motion for Close
-        mu, sigma = 0.12, 0.25
-        dt = 1/252
-        close = [2400.0]
-        for _ in range(1, len(rng)):
-            shock = np.random.normal(loc=(mu - 0.5*sigma**2)*dt, scale=sigma*np.sqrt(dt))
-            close.append(close[-1] * np.exp(shock))
-        close = np.array(close)
-        # Build OHLCV around Close
-        high = close * (1 + np.random.uniform(0.002, 0.01, size=len(rng)))
-        low  = close * (1 - np.random.uniform(0.002, 0.01, size=len(rng)))
-        openp = (high + low) / 2 + np.random.uniform(-5, 5, size=len(rng))
-        vol = np.random.randint(2_000_000, 12_000_000, size=len(rng))
-        demo = pd.DataFrame({"Open": openp, "High": high, "Low": low, "Close": close, "Volume": vol}, index=rng)
-        st.warning("All online sources failed — using DEMO synthetic OHLCV so the app remains usable.")
-        return demo
-
-    # ---------- D) Give up ----------
-    raise RuntimeError("No data returned from Yahoo/NSE and no CSV provided. Please upload OHLCV CSV in the sidebar.")
-
+@st.cache_data(show_spinner=False)
+def make_demo_ohlcv(years: int) -> pd.DataFrame:
+    """Generate a clearly-labeled synthetic OHLCV so the app always renders."""
+    periods = 252 * max(1, years)
+    rng = pd.bdate_range(end=pd.Timestamp.utcnow().normalize(), periods=periods)
+    mu, sigma, dt = 0.12, 0.25, 1/252
+    close = [2400.0]
+    for _ in range(1, len(rng)):
+        shock = np.random.normal(loc=(mu - 0.5*sigma**2)*dt, scale=sigma*np.sqrt(dt))
+        close.append(close[-1] * np.exp(shock))
+    close = np.array(close)
+    high = close * (1 + np.random.uniform(0.002, 0.01, size=len(rng)))
+    low  = close * (1 - np.random.uniform(0.002, 0.01, size=len(rng)))
+    openp = (high + low) / 2
+    vol = np.random.randint(2_000_000, 12_000_000, size=len(rng))
+    return pd.DataFrame({"Open": openp, "High": high, "Low": low, "Close": close, "Volume": vol}, index=rng)
 
 # -------------------------------
 # Features
@@ -446,42 +401,46 @@ def plot_roc_small(y_true, prob, title):
     return fig
 
 # -------------------------------
-# Sidebar (auto-load; no buttons)
+# Sidebar (CSV-first approach)
 # -------------------------------
 st.sidebar.header("Configuration")
-# You can also put "RELIANCE" (no suffix) — loader will add .NS
-ticker = st.sidebar.text_input("Ticker (Yahoo/NSE)", value="RELIANCE")
-years = st.sidebar.slider("Years of history", 2, 5, 2)
+# User label for titles; loader will add .NS if needed
+ticker = st.sidebar.text_input("Ticker label (for titles only)", value="RELIANCE")
+years = st.sidebar.slider("Years of history (for online/demo)", 2, 5, 2)
 use_trend_filter = st.sidebar.checkbox("Trend Filter (SMA50 > SMA200)", value=True)
 
-# --- New: offline/data fallback controls ---
 uploaded_csv = st.sidebar.file_uploader(
     "Upload OHLCV CSV (Date,Open,High,Low,Close,Volume)", type=["csv"]
 )
 use_demo_if_offline = st.sidebar.toggle(
-    "If network fails, use Demo data", value=True,
+    "If network fails and no CSV, use Demo", value=True,
     help="Keeps the app working even if Yahoo/NSE are unreachable."
 )
 
-
 # -------------------------------
-# AUTO LOAD (visible status + cache)
+# AUTO LOAD (CSV → online → demo)
 # -------------------------------
-with st.status("Fetching data…", expanded=False) as s:
+with st.status("Loading data…", expanded=False) as s:
     try:
-        df = load_ohlcv(
-            ticker,
-            years,
-            uploaded_csv.getvalue() if uploaded_csv else None,
-            use_demo_if_offline
-        )
+        if uploaded_csv is not None:
+            df = load_from_csv(uploaded_csv.getvalue())
+            s.update(label=f"✅ Loaded {len(df)} rows from uploaded CSV", state="complete")
+        else:
+            online = load_online(ticker, years)
+            if online is not None and len(online) > 0:
+                df = online
+                s.update(label=f"✅ Loaded {len(df)} rows from online sources", state="complete")
+            elif use_demo_if_offline:
+                df = make_demo_ohlcv(years)
+                st.warning("All online sources failed — using DEMO synthetic OHLCV so the dashboard stays interactive.")
+                s.update(label=f"✅ Generated {len(df)} demo rows", state="complete")
+            else:
+                raise RuntimeError("No CSV uploaded and online sources failed. Please upload an OHLCV CSV.")
         feat = compute_indicators(df)
         feat = apply_feature_clipping(feat).replace([np.inf, -np.inf], np.nan).dropna()
-        s.update(label=f"✅ Loaded {len(df)} rows", state="complete")
     except Exception as e:
         s.update(label=f"❌ Data load failed: {e}", state="error")
         st.stop()
-
 
 data = feat.copy()
 feature_cols = [c for c in data.columns if c != "y"]
@@ -530,7 +489,7 @@ with tab_overview:
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
                         row_heights=[0.55, 0.15, 0.15, 0.15],
                         vertical_spacing=0.03,
-                        subplot_titles=("Price", "Volume", "RSI (14)", "MACD (12,26,9)"))
+                        subplot_titles=(f"{ticker} Price", "Volume", "RSI (14)", "MACD (12,26,9)"))
 
     if have_ohlc:
         fig.add_trace(go.Candlestick(x=df_view.index,
@@ -562,7 +521,6 @@ with tab_overview:
 
     fig.update_layout(height=900, margin=dict(l=10, r=10, t=40, b=10),
                       xaxis_rangeslider_visible=False, showlegend=False)
-    fig.update_yaxes(title_text=f"{ticker} Price", row=1, col=1)
     if have_vol: fig.update_yaxes(title_text="Volume", row=2, col=1)
     fig.update_yaxes(title_text="RSI", row=3, col=1, range=[0, 100])
     fig.update_yaxes(title_text="MACD", row=4, col=1)
@@ -583,7 +541,7 @@ with tab_train:
     tscv = TimeSeriesSplit(n_splits=3)
 
     if ("best_est" not in st.session_state) or (st.session_state.get("trained_model_name") != model_choice):
-        with st.status("Training model…", expanded=False) as s:
+        with st.status("Training model…", expanded=False) as s2:
             search = RandomizedSearchCV(
                 pipe,
                 param_distributions=grids[model_choice],
@@ -591,7 +549,7 @@ with tab_train:
                 random_state=GLOBAL_SEED, refit=True
             )
             search.fit(X_train, y_train)
-            th_cv, thcv_f1 = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
+            th_cv, _ = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
             st.session_state.update({
                 "best_est": search.best_estimator_,
                 "best_params": search.best_params_,
@@ -600,7 +558,7 @@ with tab_train:
                 "model_choice": model_choice,
                 "trained_model_name": model_choice
             })
-            s.update(label="✅ Training complete", state="complete")
+            s2.update(label="✅ Training complete", state="complete")
 
     best_est = st.session_state["best_est"]
     th = st.session_state["cv_threshold"]
