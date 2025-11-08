@@ -1,0 +1,1 @@
+streamlit\nyfinance\nscikit-learn\nxgboost\ncatboost\nplotly\nmatplotlib\npandas\nnumpy\n
