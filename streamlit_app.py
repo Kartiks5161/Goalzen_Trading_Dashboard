@@ -55,17 +55,17 @@ def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_ohlcv(ticker: str, years: int) -> pd.DataFrame:
     """
-    Robust daily OHLCV loader:
-    - auto add .NS for NSE stocks
+    Robust OHLCV loader with:
+    - NSE suffix auto-fix
     - retries with backoff
-    - falls back from period= to start/end and to Ticker.history()
-    - threads=False to avoid hangs on Streamlit Cloud
+    - fallback download paths
+    - threads=False to avoid Streamlit Cloud hang
     """
     import time
     from datetime import datetime, timedelta
-    import yfinance as yf
 
     def _flatten_cols(df):
         if isinstance(df.columns, pd.MultiIndex):
@@ -77,25 +77,79 @@ def load_ohlcv(ticker: str, years: int) -> pd.DataFrame:
 
     raw = ticker.strip()
     t = raw.upper()
+
+    # Auto-append NSE suffix
     if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
         t = t + ".NS"
 
-    start = (datetime.utcnow() - timedelta(days=int(365*years + 30))).date().isoformat()
+    start = (datetime.utcnow() - timedelta(days=int(365 * years + 30))).date().isoformat()
     end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
 
     def _try(fn):
         for k in range(3):
             try:
-                df = fn()
-                if df is not None and len(df) > 0:
-                    return df
+                d = fn()
+                if d is not None and len(d) > 0:
+                    return d
             except Exception:
                 pass
-            time.sleep(0.8*(k+1))
+            time.sleep(0.7 * (k + 1))
         return None
 
-    df = _try(lambda: yf.download(t, per_
+    # A) Primary: period download
+    df = _try(lambda: yf.download(t, period=f"{years}y", interval="1d",
+                                  auto_adjust=False, progress=False, threads=False))
 
+    # B) If empty, try explicit date range
+    if df is None:
+        df = _try(lambda: yf.download(t, start=start, end=end, interval="1d",
+                                      auto_adjust=False, progress=False, threads=False))
+
+    # C) If still empty, fallback to Ticker().history()
+    if df is None:
+        tk = yf.Ticker(t)
+        df = _try(lambda: tk.history(start=start, end=end, interval="1d", auto_adjust=False))
+
+    # D) Final fallback: try raw (no suffix)
+    if df is None and t != raw:
+        df = _try(lambda: yf.download(raw, start=start, end=end, interval="1d",
+                                      auto_adjust=False, progress=False, threads=False))
+
+    if df is None or len(df) == 0:
+        raise RuntimeError("No data returned from Yahoo. Try another stock or wait and retry.")
+
+    df = _flatten_cols(df.dropna(how="all").sort_index())
+
+    def pick(key, avoid=None):
+        cols = [c for c in df.columns if key in c]
+        if avoid:
+            filtered = [c for c in cols if avoid not in c]
+            if len(filtered) > 0:
+                return filtered[0]
+        return cols[0] if cols else None
+
+    open_c  = pick("open")
+    high_c  = pick("high")
+    low_c   = pick("low")
+    close_c = pick("close", avoid="adj")
+    vol_c   = pick("volume")
+
+    if close_c is None or vol_c is None:
+        raise RuntimeError(f"Missing price/volume columns. Columns found: {list(df.columns)[:10]}")
+
+    out = pd.DataFrame(index=df.index)
+    if open_c and high_c and low_c:
+        out["Open"] = pd.to_numeric(df[open_c], errors="coerce")
+        out["High"] = pd.to_numeric(df[high_c], errors="coerce")
+        out["Low"]  = pd.to_numeric(df[low_c],  errors="coerce")
+
+    out["Close"]  = pd.to_numeric(df[close_c], errors="coerce")
+    out["Volume"] = pd.to_numeric(df[vol_c],   errors="coerce")
+
+    out = out.dropna(subset=["Close","Volume"])
+    if out.empty:
+        raise RuntimeError("Data loaded, but rows dropped during cleanup. Try a different period.")
+    return out
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Features for TRAINING + target y (next-day Up/Down)."""
