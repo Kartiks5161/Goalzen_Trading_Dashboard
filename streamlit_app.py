@@ -55,31 +55,91 @@ def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 @st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False)
 def load_ohlcv(ticker: str, years: int) -> pd.DataFrame:
-    """Robust daily OHLCV loader that survives Yahoo quirks."""
-    df = yf.download(
-        tickers=ticker,
-        period=f"{years}y",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-    )
-    if df is None or len(df) == 0:
-        raise RuntimeError("No data returned from Yahoo. Check ticker/internet.")
-    df = _flatten_cols(df.dropna().copy().sort_index())
+    """
+    Robust daily OHLCV loader with:
+    - NSE suffix auto-fix (.NS)
+    - fallback from period=Y to explicit start/end
+    - fallback to Ticker.history()
+    - simple retry for Yahoo hiccups
+    """
+    import time
+    import pandas as pd
+    import numpy as np
+    import yfinance as yf
+    from datetime import datetime, timedelta
 
-    # Pick first column containing each key
+    def _flatten_cols(df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ["_".join([str(x) for x in t if str(x)]).strip() for t in df.columns]
+        else:
+            df.columns = [str(c) for c in df.columns]
+        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+        return df
+
+    # ---- 1) Ticker normalization (NSE & indices)
+    t = ticker.strip().upper()
+    # if it's an Indian equity without suffix, try adding .NS
+    if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
+        t_ns = t + ".NS"
+    else:
+        t_ns = t
+
+    # ---- 2) Try a few strategies with small retries
+    attempts = []
+    start = (datetime.utcnow() - timedelta(days=int(years*365 + 30))).date().isoformat()
+    end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()  # include today buffer
+
+    def _try(method_desc, fn):
+        for k in range(3):
+            try:
+                df = fn()
+                if df is not None and len(df) > 0:
+                    return df
+            except Exception:
+                pass
+            time.sleep(0.8 * (k+1))  # tiny backoff
+        attempts.append(method_desc)
+        return None
+
+    # A) period API, as-is
+    df = _try(f"download(period={years}y) {t_ns}", lambda: yf.download(
+        t_ns, period=f"{years}y", interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False
+    ))
+    # B) explicit start/end
+    if df is None:
+        df = _try(f"download(start/end) {t_ns}", lambda: yf.download(
+            t_ns, start=start, end=end, interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False
+        ))
+    # C) Ticker.history() fallback
+    if df is None:
+        tk = yf.Ticker(t_ns)
+        df = _try(f"Ticker.history {t_ns}", lambda: tk.history(start=start, end=end, interval="1d", auto_adjust=False))
+
+    # D) if still empty and user didn’t type a suffix, try the raw symbol once
+    if (df is None or len(df)==0) and (t_ns != t):
+        df = _try(f"final fallback {t}", lambda: yf.download(
+            t, start=start, end=end, interval="1d", auto_adjust=False, progress=False, group_by="column", threads=False
+        ))
+
+    if df is None or len(df) == 0:
+        raise RuntimeError(
+            f"No data returned from Yahoo after attempts: {', '.join(attempts)}. "
+            f"Check the symbol (e.g., RELIANCE.NS for NSE) or try later."
+        )
+
+    df = _flatten_cols(df.dropna(how="all").copy().sort_index())
+
+    # pick columns robustly
     def pick(key, prefer_not=None):
         cols = [c for c in df.columns if key in c]
         if prefer_not:
             cols = [c for c in cols if prefer_not not in c] or cols
         return cols[0] if cols else None
 
-    open_c  = pick("open")
-    high_c  = pick("high")
-    low_c   = pick("low")
-    close_c = pick("close", prefer_not="adj")
-    vol_c   = pick("volume")
+    open_c  = pick("open"); high_c = pick("high"); low_c = pick("low")
+    close_c = pick("close", prefer_not="adj"); vol_c = pick("volume")
 
     if close_c is None or vol_c is None:
         preview = list(df.columns)[:10]
@@ -93,7 +153,12 @@ def load_ohlcv(ticker: str, years: int) -> pd.DataFrame:
     out["Close"]  = pd.to_numeric(df[close_c], errors="coerce")
     out["Volume"] = pd.to_numeric(df[vol_c],   errors="coerce")
 
-    return out.dropna(subset=["Close", "Volume"]).copy()
+    # drop days without close/volume
+    out = out.dropna(subset=["Close", "Volume"])
+
+    if len(out) == 0:
+        raise RuntimeError("Data fetched but empty after cleaning. Try a different symbol or larger date range.")
+    return out
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Features for TRAINING + target y (next-day Up/Down)."""
