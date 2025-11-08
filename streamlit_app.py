@@ -12,7 +12,6 @@ from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
 
 from xgboost import XGBClassifier
-from lightgbm import LGBMClassifier
 from catboost import CatBoostClassifier
 
 from plotly.subplots import make_subplots
