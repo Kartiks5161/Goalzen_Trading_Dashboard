@@ -469,6 +469,57 @@ with tab_overview:
         days = int(choice[:-1]); return df_in.tail(days)
     df_view = slice_by_range(df, range_choice)
 
+    # --- Downloads: helper script from repo + current data as CSV ---
+    import io
+    from pathlib import Path
+    
+    st.markdown("### Downloads")
+    st.caption("Grab the helper script or export the currently loaded OHLCV as CSV.")
+    
+    # 1) Download the Python helper that lives in your repo
+    #    Adjust the relative path if your file is in a subfolder.
+    from pathlib import Path
+
+    # ✅ Safe resolution of repo root (works locally & on Streamlit Cloud)
+    try:
+        repo_root = Path(__file__).parent
+    except NameError:
+        # __file__ may not exist in some Streamlit cloud executions, fallback:
+        repo_root = Path.cwd()
+    
+    script_path = repo_root / "csv_downloader.py"   # <-- adjust if in subfolder
+
+    
+    try:
+        script_bytes = script_path.read_bytes()
+        st.download_button(
+            label="⬇️ Download csv_downloader.py",
+            data=script_bytes,
+            file_name="csv_downloader.py",
+            mime="text/x-python",
+            help=f"Python script from {script_path.name} to fetch Indian OHLCV and save to CSV."
+        )
+    except FileNotFoundError:
+        st.error(f"Could not find {script_path}. Check the path or repo structure.")
+    
+    # 2) Download the CURRENT DATA as CSV (whatever's in df right now)
+    csv_buf = io.StringIO()
+    (
+        df.reset_index()
+          .rename(columns={"index": "Date"})
+          .assign(Date=lambda d: pd.to_datetime(d["Date"]).dt.strftime("%Y-%m-%d"))
+          [["Date","Open","High","Low","Close","Volume"]]
+          .to_csv(csv_buf, index=False)
+    )
+    st.download_button(
+        label=f"⬇️ Download current OHLCV for {ticker}",
+        data=csv_buf.getvalue(),
+        file_name=f"{ticker.replace('.', '_')}_ohlcv_loaded.csv",
+        mime="text/csv",
+        help="This is exactly the data currently shown in the dashboard."
+    )
+
+    
     have_ohlc = all(c in df_view.columns for c in ["Open", "High", "Low", "Close"])
     have_vol  = "Volume" in df_view.columns
 
