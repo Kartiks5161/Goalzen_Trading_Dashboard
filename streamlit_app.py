@@ -281,6 +281,27 @@ st.sidebar.header("Configuration")
 ticker = st.sidebar.text_input("Ticker (Yahoo Finance)", value="RELIANCE.NS")
 years = st.sidebar.slider("Years of history", 1, 5, 2)
 use_trend_filter = st.sidebar.checkbox("Trend Filter (SMA50 > SMA200)", value=True)
+# Buttons to avoid heavy work at startup
+load_btn = st.sidebar.button("🔄 Load / Refresh Data")
+train_btn = st.sidebar.button("🚀 Train & Tune")
+
+# Load data only on demand (or first run)
+if load_btn or ("df" not in st.session_state):
+    with st.status("Fetching data from Yahoo…", expanded=False):
+        df = load_ohlcv(ticker, years)
+        feat = compute_indicators(df)
+        # your clipping/cleaning
+        feat = apply_feature_clipping(feat).replace([np.inf, -np.inf], np.nan).dropna()
+        st.session_state.df = df
+        st.session_state.feat = feat
+
+df   = st.session_state.get("df")
+feat = st.session_state.get("feat")
+
+# If no data yet, stop before tabs render (prevents blank screen/503)
+if df is None or feat is None or feat.empty:
+    st.warning("Click **Load / Refresh Data** to fetch price history.")
+    st.stop()
 
 # -------------------------------
 # Tabs
