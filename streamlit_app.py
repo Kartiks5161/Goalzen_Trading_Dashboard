@@ -96,12 +96,16 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 # -------------------------------
 # Robust loader: Yahoo primary, NSE fallback
 # -------------------------------
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=3600)
 def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
     """
-    Load Indian OHLCV for last N years.
-    Order: Yahoo (period→dates→history→raw) → NSE fallback (nsepython).
+    Robust Indian OHLCV loader (last N years):
+    Yahoo (period→dates→history→raw) → NSE (nsepython) → AlphaVantage (if key) → backup symbol.
+    Returns columns: Open, High, Low, Close, Volume (index = Date).
     """
+    import json
+    from datetime import datetime, timedelta
+
     raw = symbol.strip()
     t = raw.upper()
     if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
@@ -110,29 +114,58 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
     start = (datetime.utcnow() - timedelta(days=365 * years + 30)).date().isoformat()
     end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
 
-    def _try(fn, attempts=3):
+    def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+        df = _flatten_cols(df.dropna(how="all").sort_index())
+        def pick(key, avoid=None):
+            cols = [c for c in df.columns if key in c]
+            if avoid:
+                c2 = [c for c in cols if avoid not in c]
+                if c2: return c2[0]
+            return cols[0] if cols else None
+        open_c  = pick("open"); high_c = pick("high"); low_c = pick("low")
+        close_c = pick("close", avoid="adj"); vol_c = pick("volume")
+        if close_c is None or vol_c is None:
+            raise RuntimeError("Missing close/volume columns in response.")
+        out = pd.DataFrame(index=df.index)
+        if open_c and high_c and low_c:
+            out["Open"] = pd.to_numeric(df[open_c], errors="coerce")
+            out["High"] = pd.to_numeric(df[high_c], errors="coerce")
+            out["Low"]  = pd.to_numeric(df[low_c],  errors="coerce")
+        out["Close"]  = pd.to_numeric(df[close_c], errors="coerce")
+        out["Volume"] = pd.to_numeric(df[vol_c],   errors="coerce")
+        out = out.dropna(subset=["Close", "Volume"])
+        if out.empty:
+            raise RuntimeError("Data loaded, but rows dropped during cleanup.")
+        return out
+
+    def _try(fn, attempts=2):
         for k in range(attempts):
             try:
                 df = fn()
                 if df is not None and len(df) > 0:
                     return df
-            except Exception:
-                pass
-            time.sleep(0.6 * (k + 1))
+            except Exception as e:
+                # Fast-fail on common yfinance parse/timezone errors
+                if any(s in str(e) for s in [
+                    "JSONDecodeError", "Expecting value", "No timezone found", "YFTzMissingError"
+                ]):
+                    break
+            time.sleep(0.5 * (k + 1))
         return None
 
-    # A) Yahoo (period)
+    # ---------- A) Yahoo paths ----------
+    # 1) period
     df = _try(lambda: yf.download(t, period=f"{years}y", interval="1d",
                                   auto_adjust=False, progress=False, threads=False))
-    # B) Yahoo (date range)
+    # 2) explicit dates
     if df is None:
         df = _try(lambda: yf.download(t, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
-    # C) Yahoo Ticker.history
+    # 3) Ticker.history()
     if df is None:
         tk = yf.Ticker(t)
         df = _try(lambda: tk.history(start=start, end=end, interval="1d", auto_adjust=False))
-    # D) Yahoo raw symbol (no .NS)
+    # 4) raw symbol (no .NS)
     if df is None and t != raw:
         df = _try(lambda: yf.download(raw, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
@@ -141,10 +174,11 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
         try:
             return _clean_ohlcv(df)
         except Exception:
-            pass
+            pass  # fall through
 
-    # E) NSE fallback (no rate limits) — requires nsepython
-    if nse_fetch is not None:
+    # ---------- B) NSE fallback (no key needed) ----------
+    try:
+        from nsepython import nse_fetch
         sym = raw.replace(".NS", "").upper()
         start_dt = (datetime.utcnow() - timedelta(days=365 * years + 5))
         end_dt   = datetime.utcnow()
@@ -154,31 +188,70 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
             f"&from={start_dt.strftime('%d-%m-%Y')}"
             f"&to={end_dt.strftime('%d-%m-%Y')}"
         )
+        nse_df = nse_fetch(url)
+        if nse_df is not None and len(nse_df) > 0:
+            rename_map = {
+                "CH_OPENING_PRICE": "Open",
+                "CH_TRADE_HIGH_PRICE": "High",
+                "CH_TRADE_LOW_PRICE": "Low",
+                "CH_CLOSING_PRICE": "Close",
+                "CH_TOT_TRADED_QTY": "Volume",
+                "CH_TIMESTAMP": "Date",
+            }
+            for k in rename_map:
+                if k not in nse_df.columns:
+                    raise RuntimeError("NSE schema changed")
+            nse_df = nse_df.rename(columns=rename_map)
+            nse_df["Date"] = pd.to_datetime(nse_df["Date"], errors="coerce")
+            nse_df = nse_df.dropna(subset=["Date"]).set_index("Date")
+            nse_df = nse_df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
+            nse_df = nse_df.sort_index()
+            if len(nse_df) > 0:
+                return nse_df
+    except Exception:
+        pass  # proceed to Alpha Vantage
+
+    # ---------- C) Alpha Vantage optional (needs key) ----------
+    av_key = st.secrets.get("ALPHAVANTAGE_KEY") if hasattr(st, "secrets") else None
+    if av_key:
         try:
-            nse_df = nse_fetch(url)
-            if nse_df is not None and len(nse_df) > 0:
-                rename_map = {
-                    "CH_OPENING_PRICE": "Open",
-                    "CH_TRADE_HIGH_PRICE": "High",
-                    "CH_TRADE_LOW_PRICE": "Low",
-                    "CH_CLOSING_PRICE": "Close",
-                    "CH_TOT_TRADED_QTY": "Volume",
-                    "CH_TIMESTAMP": "Date",
-                }
-                for k in rename_map:
-                    if k not in nse_df.columns:
-                        raise RuntimeError("NSE schema changed")
-                nse_df = nse_df.rename(columns=rename_map)
-                nse_df["Date"] = pd.to_datetime(nse_df["Date"], errors="coerce")
-                nse_df = nse_df.dropna(subset=["Date"]).set_index("Date")
-                nse_df = nse_df[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce").dropna()
-                nse_df = nse_df.sort_index()
-                if len(nse_df) > 0:
-                    return nse_df
+            import requests
+            sym = raw.replace(".NS", "").upper()
+            url = ("https://www.alphavantage.co/query"
+                   f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={sym}.BSE&outputsize=full&apikey={av_key}")
+            r = requests.get(url, timeout=20)
+            js = r.json()
+            ts = js.get("Time Series (Daily)", {})
+            if ts:
+                recs = []
+                cutoff = datetime.utcnow() - timedelta(days=365 * years + 5)
+                for d, v in ts.items():
+                    dt = datetime.strptime(d, "%Y-%m-%d")
+                    if dt < cutoff: continue
+                    recs.append({
+                        "Date": dt,
+                        "Open": float(v["1. open"]),
+                        "High": float(v["2. high"]),
+                        "Low":  float(v["3. low"]),
+                        "Close":float(v["4. close"]),
+                        "Volume":float(v["6. volume"]),
+                    })
+                av_df = pd.DataFrame(recs).set_index("Date").sort_index()
+                if len(av_df) > 0:
+                    return av_df
         except Exception:
             pass
 
-    raise RuntimeError("No data returned from Yahoo/NSE. Try later or another symbol.")
+    # ---------- D) Last safety: backup symbol so app still renders ----------
+    backup = "INFY.NS" if t != "INFY.NS" else "TCS.NS"
+    df = _try(lambda: yf.download(backup, period=f"{years}y", interval="1d",
+                                  auto_adjust=False, progress=False, threads=False))
+    if df is not None and len(df) > 0:
+        st.warning(f"Falling back to {backup} because {raw} failed to load.")
+        return _clean_ohlcv(df)
+
+    raise RuntimeError(f"No data returned for {raw} from Yahoo/NSE/AV. Try later or another symbol.")
+
 
 # -------------------------------
 # Features
