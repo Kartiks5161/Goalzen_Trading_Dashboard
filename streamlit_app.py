@@ -2,7 +2,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-import os, random, time, io
+import os, random, time, io, hashlib
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -95,7 +95,7 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # -------------------------------
-# Loaders: CSV / Yahoo / NSE / Demo
+# Loaders: CSV / Yahoo / NSE
 # -------------------------------
 @st.cache_data(show_spinner=False)
 def load_from_csv(file_bytes: bytes) -> pd.DataFrame:
@@ -204,23 +204,6 @@ def load_online(symbol: str, years: int) -> Optional[pd.DataFrame]:
         pass
 
     return None
-
-@st.cache_data(show_spinner=False)
-def make_demo_ohlcv(years: int) -> pd.DataFrame:
-    """Generate a clearly-labeled synthetic OHLCV so the app always renders."""
-    periods = 252 * max(1, years)
-    rng = pd.bdate_range(end=pd.Timestamp.utcnow().normalize(), periods=periods)
-    mu, sigma, dt = 0.12, 0.25, 1/252
-    close = [2400.0]
-    for _ in range(1, len(rng)):
-        shock = np.random.normal(loc=(mu - 0.5*sigma**2)*dt, scale=sigma*np.sqrt(dt))
-        close.append(close[-1] * np.exp(shock))
-    close = np.array(close)
-    high = close * (1 + np.random.uniform(0.002, 0.01, size=len(rng)))
-    low  = close * (1 - np.random.uniform(0.002, 0.01, size=len(rng)))
-    openp = (high + low) / 2
-    vol = np.random.randint(2_000_000, 12_000_000, size=len(rng))
-    return pd.DataFrame({"Open": openp, "High": high, "Low": low, "Close": close, "Volume": vol}, index=rng)
 
 # -------------------------------
 # Features
@@ -406,38 +389,49 @@ def plot_roc_small(y_true, prob, title):
 st.sidebar.header("Configuration")
 # User label for titles; loader will add .NS if needed
 ticker = st.sidebar.text_input("Ticker label (for titles only)", value="RELIANCE")
-years = st.sidebar.slider("Years of history (for online/demo)", 2, 5, 2)
+years = st.sidebar.slider("Years of history (for online fetch)", 2, 5, 2)
 use_trend_filter = st.sidebar.checkbox("Trend Filter (SMA50 > SMA200)", value=True)
 
 uploaded_csv = st.sidebar.file_uploader(
     "Upload OHLCV CSV (Date,Open,High,Low,Close,Volume)", type=["csv"]
 )
-use_demo_if_offline = st.sidebar.toggle(
-    "If network fails and no CSV, use Demo", value=True,
-    help="Keeps the app working even if Yahoo/NSE are unreachable."
-)
 
 # -------------------------------
-# AUTO LOAD (CSV → online → demo)
+# LOAD DATA (CSV first; otherwise try online; NO DEMO)
 # -------------------------------
+colA, colB = st.columns([1, 3])
+with colA:
+    if st.button("🔁 Clear cache & reload"):
+        st.cache_data.clear()
+        st.experimental_rerun()
+
+data_source_label = ""
+
 with st.status("Loading data…", expanded=False) as s:
     try:
         if uploaded_csv is not None:
-            df = load_from_csv(uploaded_csv.getvalue())
-            s.update(label=f"✅ Loaded {len(df)} rows from uploaded CSV", state="complete")
+            file_bytes = uploaded_csv.getvalue()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            if st.session_state.get("last_file_hash") != file_hash:
+                st.cache_data.clear()
+                st.session_state["last_file_hash"] = file_hash
+            df = load_from_csv(file_bytes)
+            data_source_label = f"CSV: {uploaded_csv.name}"
+            s.update(label=f"✅ Loaded {len(df)} rows from uploaded CSV: {uploaded_csv.name}", state="complete")
         else:
             online = load_online(ticker, years)
-            if online is not None and len(online) > 0:
-                df = online
-                s.update(label=f"✅ Loaded {len(df)} rows from online sources", state="complete")
-            elif use_demo_if_offline:
-                df = make_demo_ohlcv(years)
-                st.warning("All online sources failed — using DEMO synthetic OHLCV so the dashboard stays interactive.")
-                s.update(label=f"✅ Generated {len(df)} demo rows", state="complete")
-            else:
-                raise RuntimeError("No CSV uploaded and online sources failed. Please upload an OHLCV CSV.")
+            if online is None or online.empty:
+                raise RuntimeError(
+                    "No CSV uploaded and online sources failed. "
+                    "Please upload an OHLCV CSV (Date,Open,High,Low,Close,Volume)."
+                )
+            df = online
+            data_source_label = f"Online: {ticker.upper()}"
+            s.update(label=f"✅ Loaded {len(df)} rows from online sources", state="complete")
+
         feat = compute_indicators(df)
         feat = apply_feature_clipping(feat).replace([np.inf, -np.inf], np.nan).dropna()
+
     except Exception as e:
         s.update(label=f"❌ Data load failed: {e}", state="error")
         st.stop()
@@ -463,6 +457,15 @@ tab_overview, tab_train, tab_eval, tab_backtest, tab_predict, tab_insights = st.
 with tab_overview:
     st.subheader("Price • Volume • RSI • MACD")
 
+    # Small badge showing source
+    st.markdown(
+        f"""<div style="display:inline-block;padding:4px 8px;border:1px solid #6b7280;
+                        border-radius:8px;font-size:12px;color:#9ca3af;">
+                Data source: <b style="color:#e5e7eb;">{data_source_label}</b>
+            </div>""",
+        unsafe_allow_html=True
+    )
+
     range_choice = st.selectbox("Show price history for:", ["30D", "90D", "180D", "365D", "All"], index=2)
     def slice_by_range(df_in, choice):
         if choice == "All": return df_in
@@ -470,26 +473,17 @@ with tab_overview:
     df_view = slice_by_range(df, range_choice)
 
     # --- Downloads: helper script from repo + current data as CSV ---
-    import io
-    from pathlib import Path
-    
-    st.markdown("### Downloads")
-    st.caption("Grab the helper script or export the currently loaded OHLCV as CSV.")
-    
-    # 1) Download the Python helper that lives in your repo
-    #    Adjust the relative path if your file is in a subfolder.
     from pathlib import Path
 
-    # ✅ Safe resolution of repo root (works locally & on Streamlit Cloud)
+    st.markdown("### Downloads")
+    st.caption("Grab the helper script or export the currently loaded OHLCV as CSV.")
+
     try:
         repo_root = Path(__file__).parent
     except NameError:
-        # __file__ may not exist in some Streamlit cloud executions, fallback:
         repo_root = Path.cwd()
-    
-    script_path = repo_root / "csv_downloader.py"   # <-- adjust if in subfolder
+    script_path = repo_root / "csv_downloader.py"
 
-    
     try:
         script_bytes = script_path.read_bytes()
         st.download_button(
@@ -501,8 +495,7 @@ with tab_overview:
         )
     except FileNotFoundError:
         st.error(f"Could not find {script_path}. Check the path or repo structure.")
-    
-    # 2) Download the CURRENT DATA as CSV (whatever's in df right now)
+
     csv_buf = io.StringIO()
     (
         df.reset_index()
@@ -519,7 +512,6 @@ with tab_overview:
         help="This is exactly the data currently shown in the dashboard."
     )
 
-    
     have_ohlc = all(c in df_view.columns for c in ["Open", "High", "Low", "Close"])
     have_vol  = "Volume" in df_view.columns
 
@@ -585,14 +577,11 @@ with tab_train:
     st.subheader("Model Training (RandomizedSearchCV, cv=3)")
 
     st.markdown("### 🔍 Compare Models Side-by-Side")
-    
     if st.button("Run Comparison (Fast Benchmark)", type="primary"):
-        from contextlib import suppress
         models, grids = build_models()
         tscv = TimeSeriesSplit(n_splits=3)
         results = []
-    
-        # Nice status box
+
         with st.status("Running model comparison…", expanded=True) as status:
             for name, pipe in models.items():
                 st.write(f"⏳ Training **{name}** …")
@@ -603,11 +592,10 @@ with tab_train:
                     n_jobs=1, random_state=GLOBAL_SEED, refit=True
                 )
                 search.fit(X_train, y_train)
-    
+
                 th_cv, _ = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
                 best_est = search.best_estimator_
-    
-                # Probabilities on test
+
                 if hasattr(best_est, "predict_proba"):
                     y_proba_test = best_est.predict_proba(X_test)[:, 1]
                 elif hasattr(best_est, "decision_function"):
@@ -616,35 +604,32 @@ with tab_train:
                 else:
                     y_proba_test = best_est.predict(X_test).astype(float)
                 y_pred_test = (y_proba_test >= th_cv).astype(int)
-    
-                # Metrics
+
                 acc = accuracy_score(y_test, y_pred_test)
                 prec = precision_score(y_test, y_pred_test, zero_division=0)
                 rec = recall_score(y_test, y_pred_test, zero_division=0)
                 f1  = f1_score(y_test, y_pred_test, zero_division=0)
                 results.append([name, acc, prec, rec, f1])
-    
+
             status.update(label="✅ Comparison completed", state="complete")
             st.toast("Training completed for all models", icon="✅")
-    
-        # ---------- Styled results table (dark-theme friendly) ----------
+
         df_results = pd.DataFrame(
             results, columns=["Model", "Accuracy", "Precision", "Recall", "F1 Score"]
         )
         best_idx = int(df_results["F1 Score"].idxmax())
         df_display = df_results.copy()
         df_display.loc[best_idx, "Model"] = df_display.loc[best_idx, "Model"] + "  ✅ (best F1)"
-    
-        # Colors tuned for dark backgrounds
-        BEST_ROW_BG   = "rgba(34, 197, 94, 0.20)"   # green-500 @ 20%
+
+        BEST_ROW_BG   = "rgba(34, 197, 94, 0.20)"
         BEST_BORDER   = "rgba(34, 197, 94, 0.85)"
-        COL_MAX_BG    = "rgba(234, 179, 8, 0.18)"   # amber-400 @ 18%
-    
+        COL_MAX_BG    = "rgba(234, 179, 8, 0.18)"
+
         def _row_best_style(row):
             if row.name == best_idx:
                 return [f"font-weight:700; background-color:{BEST_ROW_BG}"] * len(row)
             return [""] * len(row)
-    
+
         styler = (
             df_display.style
             .format({"Accuracy":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1 Score":"{:.3f}"})
@@ -653,8 +638,6 @@ with tab_train:
             .set_properties(subset=pd.IndexSlice[best_idx, :], **{"border": f"2px solid {BEST_BORDER}"})
             .hide(axis="index")
         )
-    
-        # Render as HTML for consistent styling; fall back if needed
         try:
             st.markdown(styler.to_html(), unsafe_allow_html=True)
         except Exception:
@@ -664,10 +647,6 @@ with tab_train:
                 }),
                 use_container_width=True
             )
-    
-
-
-    
 
     models, grids = build_models()
     model_names = list(models.keys())
@@ -862,10 +841,8 @@ with tab_insights:
         model_name = st.session_state.get("model_choice", "Model")
         th = float(st.session_state.get("cv_threshold", 0.5))
 
-        # Refit on train for stable importances & outputs
         best_est.fit(X_train, y_train)
 
-        # Robust probabilities on test set
         if hasattr(best_est, "predict_proba"):
             y_proba = best_est.predict_proba(X_test)[:, 1]
         elif hasattr(best_est, "decision_function"):
@@ -876,12 +853,7 @@ with tab_insights:
 
         y_pred = (y_proba >= th).astype(int)
 
-        # =========================================================
-        # 1) What drives the prediction (human-friendly importances)
-        # =========================================================
         st.markdown("### 1) What drives the prediction")
-
-        # Try native importances; fallback to permutation importance
         final_clf = best_est.named_steps.get("clf", best_est)
         importances = None
         try:
@@ -904,7 +876,6 @@ with tab_insights:
             )
             importances = pd.Series(r.importances_mean, index=feature_cols)
 
-        # Friendly labels & categories
         friendly = {
             "Return": "Today’s % price move",
             "Return_lag_1": "Yesterday’s % move",
@@ -932,7 +903,6 @@ with tab_insights:
             "MACD_Signal": "MACD signal",
             "MACD_Hist": "MACD histogram",
         }
-
         def category(feat: str) -> str:
             f = feat.lower()
             if "volume" in f: return "Participation (Volume)"
@@ -941,7 +911,6 @@ with tab_insights:
             if "sma" in f or "ema" in f or "close_to" in f: return "Trend / Averages"
             if "return" in f: return "Short-term Momentum"
             return "Other"
-
         explain = {
             "Participation (Volume)": "Bigger volume/changes show stronger conviction.",
             "Momentum Oscillators":  "Momentum turns & overbought/oversold zones (RSI/MACD).",
@@ -950,7 +919,6 @@ with tab_insights:
             "Short-term Momentum":   "Recent moves tend to carry into the next day.",
             "Other":                 "Minor supporting signals."
         }
-
         cat_colors = {
             "Participation (Volume)": "#3b82f6",
             "Momentum Oscillators":  "#a855f7",
@@ -965,7 +933,7 @@ with tab_insights:
         plot_df["Label"] = plot_df["Feature"].map(lambda x: friendly.get(x, x))
         plot_df["Category"] = plot_df["Feature"].map(category)
         plot_df["Color"] = plot_df["Category"].map(cat_colors)
-        plot_df = plot_df.sort_values("Importance")  # bottom→top
+        plot_df = plot_df.sort_values("Importance")
 
         fig_imp = go.Figure(go.Bar(
             x=plot_df["Importance"],
@@ -987,18 +955,13 @@ with tab_insights:
         )
         st.plotly_chart(fig_imp, use_container_width=True)
 
-        # 3 quick takeaways
         cat_share = plot_df.groupby("Category")["Importance"].sum().sort_values(ascending=False)
         bullets = [f"- **{cat}** — {explain.get(cat, '')}" for cat in list(cat_share.index[:3])]
         st.markdown("**Takeaways:**")
         st.markdown("\n".join(bullets))
         st.caption("Higher bars = stronger influence on Up/Down decisions for this dataset.")
 
-        # =========================================================
-        # 2) Actual vs Predicted — Price + Outcome Timeline
-        # =========================================================
         st.markdown("### 2) Actual vs Predicted")
-
         pred_df = pd.DataFrame({
             "date": data.index[split_idx:],
             "close": data["Close"].iloc[split_idx:].values,
@@ -1008,8 +971,6 @@ with tab_insights:
         }).set_index("date")
 
         col1, col2 = st.columns(2)
-
-        # Left: Price with BUY markers
         with col1:
             fig_price = go.Figure()
             fig_price.add_trace(go.Scatter(
@@ -1031,19 +992,13 @@ with tab_insights:
             )
             st.plotly_chart(fig_price, use_container_width=True)
 
-        # Right: Outcome timeline (TP/FP/FN/TN) + mini hit-rate
         with col2:
             cats = []
             for yt, yp in zip(pred_df["y_true"].values, pred_df["y_pred"].values):
-                if yp == 1 and yt == 1:
-                    cats.append("Correct BUY (TP)")
-                elif yp == 1 and yt == 0:
-                    cats.append("Wrong BUY (FP)")
-                elif yp == 0 and yt == 1:
-                    cats.append("Missed Up (FN)")
-                else:
-                    cats.append("Correct NO-BUY (TN)")
-
+                if yp == 1 and yt == 1: cats.append("Correct BUY (TP)")
+                elif yp == 1 and yt == 0: cats.append("Wrong BUY (FP)")
+                elif yp == 0 and yt == 1: cats.append("Missed Up (FN)")
+                else: cats.append("Correct NO-BUY (TN)")
             color_map = {
                 "Correct BUY (TP)": "#16A34A",
                 "Wrong BUY (FP)":   "#DC2626",
@@ -1058,10 +1013,8 @@ with tab_insights:
                 hovertemplate="<b>%{x|%Y-%m-%d}</b><br>%{customdata}<extra></extra>",
                 customdata=cats, name="Outcome"
             ))
-            # Legend swatches under plot
             for name, colr in color_map.items():
                 fig_out.add_trace(go.Bar(x=[None], y=[None], name=name, marker_color=colr))
-
             fig_out.update_layout(
                 title="Prediction Outcomes",
                 height=360, margin=dict(l=10, r=10, t=40, b=0),
@@ -1070,22 +1023,16 @@ with tab_insights:
             )
             st.plotly_chart(fig_out, use_container_width=True)
 
-            # Mini cumulative accuracy
             hits = (pred_df["y_true"].values == pred_df["y_pred"].values).astype(int)
             cum_hit = np.cumsum(hits) / np.arange(1, len(hits)+1)
-            fig_hr = go.Figure(go.Scatter(x=pred_df.index, y=cum_hit,
-                                          mode="lines", name="Hit-rate"))
+            fig_hr = go.Figure(go.Scatter(x=pred_df.index, y=cum_hit, mode="lines", name="Hit-rate"))
             fig_hr.update_layout(
                 height=200, margin=dict(l=10, r=10, t=10, b=10),
                 title="Cumulative Accuracy", yaxis_title="Accuracy", xaxis_title=None
             )
             st.plotly_chart(fig_hr, use_container_width=True)
 
-        # =========================================================
-        # 3) Model performance (KPIs + simple bars)
-        # =========================================================
         st.markdown("### 3) Model Performance")
-
         acc = accuracy_score(y_test, y_pred)
         prec = precision_score(y_test, y_pred, zero_division=0)
         rec = recall_score(y_test, y_pred, zero_division=0)
@@ -1099,7 +1046,6 @@ with tab_insights:
         k4.metric("F1 Score", f"{f1:.2f}")
         k5.metric("Avg Precision (PR AUC)", f"{ap:.2f}")
 
-        st.caption("How clean the BUYs are vs how many UP days we catch at the chosen threshold.")
         fig_prbars = go.Figure()
         fig_prbars.add_trace(go.Bar(name="Precision", x=["Now"], y=[prec]))
         fig_prbars.add_trace(go.Bar(name="Recall",    x=["Now"], y=[rec]))
@@ -1111,29 +1057,21 @@ with tab_insights:
         )
         st.plotly_chart(fig_prbars, use_container_width=True)
 
-        # =========================================================
-        # 4) Strategy vs Buy & Hold (robust & compact)
-        # =========================================================
         st.markdown("### 4) Strategy vs Buy & Hold (Test Segment)")
-
-        # Buy & Hold
         ret = data["Close"].pct_change()
         bh_series = (1 + ret.iloc[split_idx:]).dropna().cumprod()
         if len(bh_series):
             bh_series = bh_series / bh_series.iloc[0]
 
-        # Strategy equity from next-day returns and predictions
         nxt_ret = data["Close"].pct_change().shift(-1)
         sig_series = pd.Series(y_pred, index=data.index[split_idx:]).astype(float)
         strat = (nxt_ret.loc[sig_series.index] * sig_series).fillna(0)
 
-        # Entry cost on opening a long
         cost = 0.0005
         open_trade = (sig_series.shift(1).fillna(0) < 1) & (sig_series == 1)
         strat[open_trade] -= cost
         eq = (1 + strat).cumprod()
 
-        # Align both series for a clean chart
         comp = pd.concat(
             [eq.rename("Strategy"), bh_series.rename("Buy & Hold")],
             axis=1
@@ -1148,7 +1086,6 @@ with tab_insights:
         m1.metric("Strategy Total Return", f"{final_strat:.2%}")
         m2.metric("Buy & Hold Total Return", f"{final_bh:.2%}")
 
-        # Plain-language summary
         pred_buys = int((y_pred == 1).sum())
         tp = int(((y_pred == 1) & (y_test == 1)).sum())
         fn = int(((y_pred == 0) & (y_test == 1)).sum())
