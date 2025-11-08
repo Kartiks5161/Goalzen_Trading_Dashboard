@@ -475,7 +475,7 @@ with tab_overview:
 
 
 with tab_train:
-    st.subheader("Model Training (Select algorithm + GridSearchCV)")
+    st.subheader("Model Training (Select algorithm + RandomizedSearchCV)")
 
     # get all models + grids
     models, grids = build_models()
@@ -485,27 +485,50 @@ with tab_train:
     # pick one
     model_choice = st.selectbox("Choose model", model_names, index=default_idx)
     pipe = models[model_choice]
-    grid = grids[model_choice]
 
-    tscv = TimeSeriesSplit(n_splits=5)
-    with st.spinner("Training & tuning..."):
-        gs = GridSearchCV(pipe, grid, scoring="f1", cv=tscv, n_jobs=-1, refit=True, verbose=0)
-        gs.fit(X_train, y_train)
+    from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+    tscv = TimeSeriesSplit(n_splits=3)
 
-    best_est = gs.best_estimator_
-    st.success(f"{model_choice} — Best CV F1: {gs.best_score_:.4f}")
+    # train only when button pressed, or first time, or if model changed
+    if train_btn or ("best_est" not in st.session_state) or (st.session_state.get("trained_model_name") != model_choice):
+        with st.status("Training model…", expanded=False):
+            search = RandomizedSearchCV(
+                pipe,
+                param_distributions=grids[model_choice],
+                n_iter=8,                    # smaller = faster on cloud
+                cv=tscv,
+                scoring="f1",
+                n_jobs=1,                    # avoid cloud thread stalls
+                random_state=42,
+                refit=True
+            )
+            search.fit(X_train, y_train)
+
+            # threshold tuning once, consistent cv folds
+            th_cv, thcv_f1 = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
+
+            # stash
+            st.session_state.update({
+                "best_est": search.best_estimator_,
+                "best_params": search.best_params_,
+                "best_cv_f1": float(search.best_score_),
+                "cv_threshold": float(th_cv),
+                "model_choice": model_choice,
+                "trained_model_name": model_choice
+            })
+
+    # guard if not trained yet
+    if "best_est" not in st.session_state:
+        st.info("Click **Train & Tune** to fit a model.")
+        st.stop()
+
+    best_est = st.session_state["best_est"]
+    th = st.session_state["cv_threshold"]
+
+    st.success(f"{model_choice} — Best CV F1: {st.session_state['best_cv_f1']:.4f}")
     st.caption("Best hyperparameters:")
-    st.json(gs.best_params_)
-
-    # threshold from CV on train only
-    th_cv, thcv_f1 = tune_threshold_cv(best_est, X_train, y_train, n_splits=5)
-    st.info(f"Auto-tuned threshold from CV: {th_cv:.3f}  (CV F1 ≈ {thcv_f1:.4f})")
-
-    # stash in session
-    st.session_state["best_est"] = best_est
-    st.session_state["cv_threshold"] = th_cv
-    st.session_state["best_params"] = gs.best_params_
-    st.session_state["model_choice"] = model_choice
+    st.json(st.session_state["best_params"])
+    st.info(f"Auto-tuned threshold from CV: {th:.3f}")
 
 # -------------------------------
 # Evaluation
