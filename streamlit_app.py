@@ -584,81 +584,87 @@ with tab_overview:
 with tab_train:
     st.subheader("Model Training (RandomizedSearchCV, cv=3)")
 
-        # ---- Quick Model Comparison (side-by-side) ----
-    st.markdown("###  Compare Models Side-by-Side")
+    st.markdown("### 🔍 Compare Models Side-by-Side")
+    
     if st.button("Run Comparison (Fast Benchmark)", type="primary"):
+        from contextlib import suppress
         models, grids = build_models()
         tscv = TimeSeriesSplit(n_splits=3)
         results = []
     
-        for name, pipe in models.items():
-            st.write(f" Training {name} ...")
-            search = RandomizedSearchCV(
-                pipe,
-                param_distributions=grids.get(name, {}),
-                n_iter=5,
-                cv=tscv,
-                scoring="f1",
-                n_jobs=1,
-                random_state=GLOBAL_SEED,
-                refit=True
-            )
-            search.fit(X_train, y_train)
+        # Nice status box
+        with st.status("Running model comparison…", expanded=True) as status:
+            for name, pipe in models.items():
+                st.write(f"⏳ Training **{name}** …")
+                search = RandomizedSearchCV(
+                    pipe,
+                    param_distributions=grids.get(name, {}),
+                    n_iter=5, cv=tscv, scoring="f1",
+                    n_jobs=1, random_state=GLOBAL_SEED, refit=True
+                )
+                search.fit(X_train, y_train)
     
-            # Predict using tuned threshold
-            th_cv, _ = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
-            best_est = search.best_estimator_
+                th_cv, _ = tune_threshold_cv(search.best_estimator_, X_train, y_train, n_splits=3)
+                best_est = search.best_estimator_
     
-            # Probabilities
-            if hasattr(best_est, "predict_proba"):
-                y_proba_test = best_est.predict_proba(X_test)[:, 1]
-            elif hasattr(best_est, "decision_function"):
-                score = best_est.decision_function(X_test)
-                y_proba_test = 1 / (1 + np.exp(-score))
-            else:
-                y_proba_test = best_est.predict(X_test).astype(float)
-            y_pred_test = (y_proba_test >= th_cv).astype(int)
+                # Probabilities on test
+                if hasattr(best_est, "predict_proba"):
+                    y_proba_test = best_est.predict_proba(X_test)[:, 1]
+                elif hasattr(best_est, "decision_function"):
+                    s = best_est.decision_function(X_test)
+                    y_proba_test = 1 / (1 + np.exp(-s))
+                else:
+                    y_proba_test = best_est.predict(X_test).astype(float)
+                y_pred_test = (y_proba_test >= th_cv).astype(int)
     
-            # Metrics
-            acc = accuracy_score(y_test, y_pred_test)
-            prec = precision_score(y_test, y_pred_test, zero_division=0)
-            rec = recall_score(y_test, y_pred_test, zero_division=0)
-            f1  = f1_score(y_test, y_pred_test, zero_division=0)
+                # Metrics
+                acc = accuracy_score(y_test, y_pred_test)
+                prec = precision_score(y_test, y_pred_test, zero_division=0)
+                rec = recall_score(y_test, y_pred_test, zero_division=0)
+                f1  = f1_score(y_test, y_pred_test, zero_division=0)
+                results.append([name, acc, prec, rec, f1])
     
-            results.append([name, acc, prec, rec, f1])
+            status.update(label="✅ Comparison completed", state="complete")
+            st.toast("Training completed for all models", icon="✅")
     
-        # Display Comparison Table
+        # ---------- Styled results table (dark-theme friendly) ----------
         df_results = pd.DataFrame(
             results, columns=["Model", "Accuracy", "Precision", "Recall", "F1 Score"]
         )
-        
-        # Find the best (by F1)
         best_idx = int(df_results["F1 Score"].idxmax())
         df_display = df_results.copy()
         df_display.loc[best_idx, "Model"] = df_display.loc[best_idx, "Model"] + "  ✅ (best F1)"
-        
-        # Build a styled HTML table (Streamlit-safe)
-        def _row_highlight_best(row):
+    
+        # Colors tuned for dark backgrounds
+        BEST_ROW_BG   = "rgba(34, 197, 94, 0.20)"   # green-500 @ 20%
+        BEST_BORDER   = "rgba(34, 197, 94, 0.85)"
+        COL_MAX_BG    = "rgba(234, 179, 8, 0.18)"   # amber-400 @ 18%
+    
+        def _row_best_style(row):
             if row.name == best_idx:
-                return ["font-weight:700; background-color:#dcfce7"] * len(row)
+                return [f"font-weight:700; background-color:{BEST_ROW_BG}"] * len(row)
             return [""] * len(row)
-        
+    
         styler = (
             df_display.style
-                .format({"Accuracy":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1 Score":"{:.3f}"})
-                .apply(_row_highlight_best, axis=1)
-                .highlight_max(subset=["Accuracy","Precision","Recall","F1 Score"], color="#fff7ed")
-                .set_properties(subset=pd.IndexSlice[best_idx, :], **{"border":"2px solid #16a34a"})
-                .hide(axis="index")
+            .format({"Accuracy":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1 Score":"{:.3f}"})
+            .apply(_row_best_style, axis=1)
+            .highlight_max(subset=["Accuracy","Precision","Recall","F1 Score"], color=COL_MAX_BG)
+            .set_properties(subset=pd.IndexSlice[best_idx, :], **{"border": f"2px solid {BEST_BORDER}"})
+            .hide(axis="index")
         )
-        
-        # Try pretty HTML first (best styling), fall back to plain dataframe if needed
+    
+        # Render as HTML for consistent styling; fall back if needed
         try:
             st.markdown(styler.to_html(), unsafe_allow_html=True)
         except Exception:
-            st.dataframe(df_display.style.format({
-                "Accuracy":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1 Score":"{:.3f}"
-            }), use_container_width=True)
+            st.dataframe(
+                df_display.style.format({
+                    "Accuracy":"{:.3f}","Precision":"{:.3f}","Recall":"{:.3f}","F1 Score":"{:.3f}"
+                }),
+                use_container_width=True
+            )
+    
 
 
     
