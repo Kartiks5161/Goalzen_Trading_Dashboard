@@ -719,47 +719,308 @@ with tab_predict:
 with tab_insights:
     st.subheader("Insights")
 
-    best_est = st.session_state["best_est"]
-    model_name = st.session_state.get("model_choice", "Model")
-    th = float(st.session_state.get("cv_threshold", 0.5))
-
-    best_est.fit(X_train, y_train)
-
-    if hasattr(best_est, "predict_proba"):
-        y_proba = best_est.predict_proba(X_test)[:, 1]
-    elif hasattr(best_est, "decision_function"):
-        s = best_est.decision_function(X_test)
-        y_proba = 1 / (1 + np.exp(-s))
+    if "best_est" not in st.session_state:
+        st.warning("Train the model first in the 'Train' tab.")
     else:
-        y_proba = best_est.predict(X_test).astype(float)
-    y_pred = (y_proba >= th).astype(int)
+        best_est = st.session_state["best_est"]
+        model_name = st.session_state.get("model_choice", "Model")
+        th = float(st.session_state.get("cv_threshold", 0.5))
 
-    # Importances (native or permutation)
-    final_clf = best_est.named_steps.get("clf", best_est)
-    importances = None
-    try:
-        if hasattr(final_clf, "feature_importances_"):
-            vals = np.asarray(final_clf.feature_importances_, dtype=float)
-            importances = pd.Series(vals, index=feature_cols)
-        elif hasattr(final_clf, "coef_"):
-            vals = np.abs(np.ravel(final_clf.coef_))
-            importances = pd.Series(vals, index=feature_cols)
-    except Exception:
+        # Refit on train for stable importances & outputs
+        best_est.fit(X_train, y_train)
+
+        # Robust probabilities on test set
+        if hasattr(best_est, "predict_proba"):
+            y_proba = best_est.predict_proba(X_test)[:, 1]
+        elif hasattr(best_est, "decision_function"):
+            s = best_est.decision_function(X_test)
+            y_proba = 1 / (1 + np.exp(-s))
+        else:
+            y_proba = best_est.predict(X_test).astype(float)
+
+        y_pred = (y_proba >= th).astype(int)
+
+        # =========================================================
+        # 1) What drives the prediction (human-friendly importances)
+        # =========================================================
+        st.markdown("### 1) What drives the prediction")
+
+        # Try native importances; fallback to permutation importance
+        final_clf = best_est.named_steps.get("clf", best_est)
         importances = None
+        try:
+            if hasattr(final_clf, "feature_importances_"):
+                vals = np.asarray(final_clf.feature_importances_, dtype=float)
+                importances = pd.Series(vals, index=feature_cols)
+            elif hasattr(final_clf, "coef_"):
+                vals = np.abs(np.ravel(final_clf.coef_))
+                importances = pd.Series(vals, index=feature_cols)
+        except Exception:
+            importances = None
 
-    if importances is None:
-        from sklearn.inspection import permutation_importance
-        st.caption("Using permutation importance (model has no native importances).")
-        n = min(len(X_test), 400)
-        r = permutation_importance(best_est, X_test[:n], y_test[:n],
-                                   n_repeats=8, random_state=GLOBAL_SEED, n_jobs=1)
-        importances = pd.Series(r.importances_mean, index=feature_cols)
+        if importances is None:
+            from sklearn.inspection import permutation_importance
+            st.caption("Using permutation importance (model has no native importances).")
+            n = min(len(X_test), 500)
+            r = permutation_importance(
+                best_est, X_test[:n], y_test[:n],
+                n_repeats=10, random_state=42, n_jobs=-1
+            )
+            importances = pd.Series(r.importances_mean, index=feature_cols)
 
-    topk = importances.sort_values(ascending=False).head(12)
-    plot_df = pd.DataFrame({"Feature": topk.index, "Importance": topk.values}).sort_values("Importance")
+        # Friendly labels & categories
+        friendly = {
+            "Return": "Today’s % price move",
+            "Return_lag_1": "Yesterday’s % move",
+            "Return_lag_2": "2-day lag return",
+            "Return_lag_3": "3-day lag return",
+            "Volatility_10": "10-day volatility",
+            "Volatility_20": "20-day volatility",
+            "Volume": "Trading volume",
+            "Volume_Change": "Change in volume",
+            "Vol_to_SMA20": "Volume vs 20-day avg",
+            "BB_Width": "Bollinger band width",
+            "BB_Upper": "Bollinger upper band",
+            "BB_Lower": "Bollinger lower band",
+            "SMA_10": "10-day average",
+            "SMA_20": "20-day average",
+            "SMA_50": "50-day average",
+            "SMA_100": "100-day average",
+            "EMA_5": "5-day EMA",
+            "EMA_12": "12-day EMA",
+            "EMA_26": "26-day EMA",
+            "Close_to_SMA_10": "Price vs 10-day avg",
+            "Close_to_SMA_20": "Price vs 20-day avg",
+            "RSI_14": "RSI (14)",
+            "MACD": "MACD",
+            "MACD_Signal": "MACD signal",
+            "MACD_Hist": "MACD histogram",
+        }
 
-    fig_imp = go.Figure(go.Bar(x=plot_df["Importance"], y=plot_df["Feature"], orientation="h"))
-    fig_imp.update_layout(height=500, margin=dict(l=10, r=10, t=50, b=10),
-                          title=f"What drives predictions — {model_name}",
-                          xaxis_title="Relative importance", yaxis_title="Signal")
-    st.plotly_chart(fig_imp, use_container_width=True)
+        def category(feat: str) -> str:
+            f = feat.lower()
+            if "volume" in f: return "Participation (Volume)"
+            if "rsi" in f or "macd" in f: return "Momentum Oscillators"
+            if "bb_" in f or "volatility" in f: return "Volatility"
+            if "sma" in f or "ema" in f or "close_to" in f: return "Trend / Averages"
+            if "return" in f: return "Short-term Momentum"
+            return "Other"
+
+        explain = {
+            "Participation (Volume)": "Bigger volume/changes show stronger conviction.",
+            "Momentum Oscillators":  "Momentum turns & overbought/oversold zones (RSI/MACD).",
+            "Volatility":            "Higher volatility often precedes bigger swings.",
+            "Trend / Averages":      "Price vs moving averages indicates trend direction.",
+            "Short-term Momentum":   "Recent moves tend to carry into the next day.",
+            "Other":                 "Minor supporting signals."
+        }
+
+        cat_colors = {
+            "Participation (Volume)": "#3b82f6",
+            "Momentum Oscillators":  "#a855f7",
+            "Volatility":             "#ef4444",
+            "Trend / Averages":       "#10b981",
+            "Short-term Momentum":    "#f59e0b",
+            "Other":                  "#6b7280",
+        }
+
+        topk = importances.sort_values(ascending=False).head(12)
+        plot_df = pd.DataFrame({"Feature": topk.index, "Importance": topk.values})
+        plot_df["Label"] = plot_df["Feature"].map(lambda x: friendly.get(x, x))
+        plot_df["Category"] = plot_df["Feature"].map(category)
+        plot_df["Color"] = plot_df["Category"].map(cat_colors)
+        plot_df = plot_df.sort_values("Importance")  # bottom→top
+
+        fig_imp = go.Figure(go.Bar(
+            x=plot_df["Importance"],
+            y=plot_df["Label"],
+            orientation="h",
+            marker=dict(color=plot_df["Color"]),
+            customdata=np.stack([
+                plot_df["Category"].values,
+                plot_df["Category"].map(explain).values
+            ], axis=1),
+            hovertemplate="<b>%{y}</b><br>Group: %{customdata[0]}<br>"
+                          "Why: %{customdata[1]}<br>Importance: %{x:.4f}<extra></extra>"
+        ))
+        fig_imp.update_layout(
+            height=500, margin=dict(l=10, r=10, t=50, b=10),
+            title=f"What drives predictions — {model_name}",
+            xaxis_title="Relative importance (higher = stronger influence)",
+            yaxis_title="Signal"
+        )
+        st.plotly_chart(fig_imp, use_container_width=True)
+
+        # 3 quick takeaways
+        cat_share = plot_df.groupby("Category")["Importance"].sum().sort_values(ascending=False)
+        bullets = [f"- **{cat}** — {explain.get(cat, '')}" for cat in list(cat_share.index[:3])]
+        st.markdown("**Takeaways:**")
+        st.markdown("\n".join(bullets))
+        st.caption("Higher bars = stronger influence on Up/Down decisions for this dataset.")
+
+        # =========================================================
+        # 2) Actual vs Predicted — Price + Outcome Timeline
+        # =========================================================
+        st.markdown("### 2) Actual vs Predicted")
+
+        pred_df = pd.DataFrame({
+            "date": data.index[split_idx:],
+            "close": data["Close"].iloc[split_idx:].values,
+            "y_true": y_test,
+            "proba_up": y_proba,
+            "y_pred": y_pred
+        }).set_index("date")
+
+        col1, col2 = st.columns(2)
+
+        # Left: Price with BUY markers
+        with col1:
+            fig_price = go.Figure()
+            fig_price.add_trace(go.Scatter(
+                x=pred_df.index, y=pred_df["close"],
+                mode="lines+markers", name="Close", marker_size=4
+            ))
+            buy_idx = pred_df.index[pred_df["y_pred"] == 1]
+            if len(buy_idx):
+                fig_price.add_trace(go.Scatter(
+                    x=buy_idx, y=pred_df.loc[buy_idx, "close"],
+                    mode="markers", name="Predicted BUY",
+                    marker_symbol="triangle-up", marker_size=10
+                ))
+            fig_price.update_layout(
+                title=f"{ticker} — Price with Predicted BUYs",
+                height=380, margin=dict(l=10, r=10, t=40, b=10),
+                xaxis_title="Date", yaxis_title=f"{ticker} Price",
+                xaxis_rangeslider_visible=False, hovermode="x unified"
+            )
+            st.plotly_chart(fig_price, use_container_width=True)
+
+        # Right: Outcome timeline (TP/FP/FN/TN) + mini hit-rate
+        with col2:
+            cats = []
+            for yt, yp in zip(pred_df["y_true"].values, pred_df["y_pred"].values):
+                if yp == 1 and yt == 1:
+                    cats.append("Correct BUY (TP)")
+                elif yp == 1 and yt == 0:
+                    cats.append("Wrong BUY (FP)")
+                elif yp == 0 and yt == 1:
+                    cats.append("Missed Up (FN)")
+                else:
+                    cats.append("Correct NO-BUY (TN)")
+
+            color_map = {
+                "Correct BUY (TP)": "#16A34A",
+                "Wrong BUY (FP)":   "#DC2626",
+                "Missed Up (FN)":   "#F59E0B",
+                "Correct NO-BUY (TN)": "#6B7280"
+            }
+            colors = [color_map[c] for c in cats]
+
+            fig_out = go.Figure(go.Bar(
+                x=pred_df.index, y=[1]*len(pred_df),
+                marker_color=colors, marker_line_width=0,
+                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>%{customdata}<extra></extra>",
+                customdata=cats, name="Outcome"
+            ))
+            # Legend swatches under plot
+            for name, colr in color_map.items():
+                fig_out.add_trace(go.Bar(x=[None], y=[None], name=name, marker_color=colr))
+
+            fig_out.update_layout(
+                title="Prediction Outcomes",
+                height=360, margin=dict(l=10, r=10, t=40, b=0),
+                xaxis_title="Date", yaxis=dict(visible=False, range=[0, 1.05]),
+                legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0)
+            )
+            st.plotly_chart(fig_out, use_container_width=True)
+
+            # Mini cumulative accuracy
+            hits = (pred_df["y_true"].values == pred_df["y_pred"].values).astype(int)
+            cum_hit = np.cumsum(hits) / np.arange(1, len(hits)+1)
+            fig_hr = go.Figure(go.Scatter(x=pred_df.index, y=cum_hit,
+                                          mode="lines", name="Hit-rate"))
+            fig_hr.update_layout(
+                height=200, margin=dict(l=10, r=10, t=10, b=10),
+                title="Cumulative Accuracy", yaxis_title="Accuracy", xaxis_title=None
+            )
+            st.plotly_chart(fig_hr, use_container_width=True)
+
+        # =========================================================
+        # 3) Model performance (KPIs + simple bars)
+        # =========================================================
+        st.markdown("### 3) Model Performance")
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        ap = average_precision_score(y_test, y_proba)
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Overall Accuracy", f"{acc:.1%}")
+        k2.metric("Precision (BUY quality)", f"{prec:.1%}")
+        k3.metric("Recall (UP coverage)", f"{rec:.1%}")
+        k4.metric("F1 Score", f"{f1:.2f}")
+        k5.metric("Avg Precision (PR AUC)", f"{ap:.2f}")
+
+        st.caption("How clean the BUYs are vs how many UP days we catch at the chosen threshold.")
+        fig_prbars = go.Figure()
+        fig_prbars.add_trace(go.Bar(name="Precision", x=["Now"], y=[prec]))
+        fig_prbars.add_trace(go.Bar(name="Recall",    x=["Now"], y=[rec]))
+        fig_prbars.update_layout(
+            barmode="group", height=220,
+            margin=dict(l=10, r=10, t=10, b=10),
+            yaxis=dict(range=[0, 1], tickformat=".0%"),
+            legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="left", x=0)
+        )
+        st.plotly_chart(fig_prbars, use_container_width=True)
+
+        # =========================================================
+        # 4) Strategy vs Buy & Hold (robust & compact)
+        # =========================================================
+        st.markdown("### 4) Strategy vs Buy & Hold (Test Segment)")
+
+        # Buy & Hold
+        ret = data["Close"].pct_change()
+        bh_series = (1 + ret.iloc[split_idx:]).dropna().cumprod()
+        if len(bh_series):
+            bh_series = bh_series / bh_series.iloc[0]
+
+        # Strategy equity from next-day returns and predictions
+        nxt_ret = data["Close"].pct_change().shift(-1)
+        sig_series = pd.Series(y_pred, index=data.index[split_idx:]).astype(float)
+        strat = (nxt_ret.loc[sig_series.index] * sig_series).fillna(0)
+
+        # Entry cost on opening a long
+        cost = 0.0005
+        open_trade = (sig_series.shift(1).fillna(0) < 1) & (sig_series == 1)
+        strat[open_trade] -= cost
+        eq = (1 + strat).cumprod()
+
+        # Align both series for a clean chart
+        comp = pd.concat(
+            [eq.rename("Strategy"), bh_series.rename("Buy & Hold")],
+            axis=1
+        ).dropna()
+
+        st.line_chart(comp, height=260)
+
+        final_strat = float(comp["Strategy"].iloc[-1] - 1.0) if len(comp) else 0.0
+        final_bh    = float(comp["Buy & Hold"].iloc[-1] - 1.0) if len(comp) else 0.0
+
+        m1, m2 = st.columns(2)
+        m1.metric("Strategy Total Return", f"{final_strat:.2%}")
+        m2.metric("Buy & Hold Total Return", f"{final_bh:.2%}")
+
+        # Plain-language summary
+        pred_buys = int((y_pred == 1).sum())
+        tp = int(((y_pred == 1) & (y_test == 1)).sum())
+        fn = int(((y_pred == 0) & (y_test == 1)).sum())
+        win_rate_buys = (tp / pred_buys) if pred_buys > 0 else 0.0
+
+        st.markdown("**What this means:**")
+        st.markdown(
+            f"- The model issued **{pred_buys} BUY signals**, of which **{tp}** were correct.  \n"
+            f"- Win-rate on BUYs: **{win_rate_buys:.0%}**. Missed UP days: **{fn}**.  \n"
+            f"- Over this test window, the strategy returned **{final_strat:.1%}** vs Buy & Hold **{final_bh:.1%}**."
+        )
