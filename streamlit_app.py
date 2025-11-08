@@ -97,23 +97,17 @@ def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 # Robust loader: Yahoo primary, NSE fallback
 # -------------------------------
 @st.cache_data(show_spinner=False, ttl=3600)
-def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_ohlcv(symbol: str, years: int, uploaded_csv_bytes: bytes | None, allow_demo: bool) -> pd.DataFrame:
     """
-    Robust Indian OHLCV loader (last N years):
-    Yahoo (period→dates→history→raw) → NSE (nsepython) → AlphaVantage (if key) → backup symbol.
-    Returns columns: Open, High, Low, Close, Volume (index = Date).
+    Robust Indian OHLCV loader (last N years).
+    Order: Yahoo (period→dates→history→raw) → NSE (nsepython) → Uploaded CSV → Demo (synthetic).
+    Returns: DataFrame with columns Open, High, Low, Close, Volume; index = Date (UTC-naive).
     """
-    import json
     from datetime import datetime, timedelta
+    import io
 
-    raw = symbol.strip()
-    t = raw.upper()
-    if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
-        t = t + ".NS"
-
-    start = (datetime.utcnow() - timedelta(days=365 * years + 30)).date().isoformat()
-    end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
-
+    # ---------- Helper: clean Yahoo/NSE frames ----------
     def _clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         df = _flatten_cols(df.dropna(how="all").sort_index())
         def pick(key, avoid=None):
@@ -138,6 +132,7 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
             raise RuntimeError("Data loaded, but rows dropped during cleanup.")
         return out
 
+    # ---------- Helper: try-with-backoff ----------
     def _try(fn, attempts=2):
         for k in range(attempts):
             try:
@@ -145,41 +140,47 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
                 if df is not None and len(df) > 0:
                     return df
             except Exception as e:
-                # Fast-fail on common yfinance parse/timezone errors
-                if any(s in str(e) for s in [
-                    "JSONDecodeError", "Expecting value", "No timezone found", "YFTzMissingError"
-                ]):
+                # Fast-fail on these Yahoo-specific errors
+                msg = str(e)
+                if any(s in msg for s in ["JSONDecodeError", "Expecting value", "No timezone found", "YFTzMissingError"]):
                     break
             time.sleep(0.5 * (k + 1))
         return None
 
-    # ---------- A) Yahoo paths ----------
-    # 1) period
+    # ---------- A) Online sources ----------
+    raw = (symbol or "").strip()
+    t = raw.upper() if raw else "RELIANCE"
+    if (not t.startswith("^")) and (".NS" not in t) and (".BO" not in t):
+        t = t + ".NS"
+
+    start = (datetime.utcnow() - timedelta(days=365 * years + 30)).date().isoformat()
+    end   = (datetime.utcnow() + timedelta(days=1)).date().isoformat()
+
+    # A1) Yahoo Finance (period)
     df = _try(lambda: yf.download(t, period=f"{years}y", interval="1d",
                                   auto_adjust=False, progress=False, threads=False))
-    # 2) explicit dates
+    # A2) Yahoo (explicit dates)
     if df is None:
         df = _try(lambda: yf.download(t, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
-    # 3) Ticker.history()
+    # A3) Yahoo Ticker.history
     if df is None:
         tk = yf.Ticker(t)
         df = _try(lambda: tk.history(start=start, end=end, interval="1d", auto_adjust=False))
-    # 4) raw symbol (no .NS)
+    # A4) Yahoo raw symbol (no .NS)
     if df is None and t != raw:
         df = _try(lambda: yf.download(raw, start=start, end=end, interval="1d",
                                       auto_adjust=False, progress=False, threads=False))
-
     if df is not None and len(df) > 0:
         try:
             return _clean_ohlcv(df)
         except Exception:
-            pass  # fall through
+            pass  # fallthrough
 
-    # ---------- B) NSE fallback (no key needed) ----------
+    # A5) NSE fallback (nsepython)
     try:
         from nsepython import nse_fetch
-        sym = raw.replace(".NS", "").upper()
+        sym = raw.replace(".NS", "").upper() or "RELIANCE"
         start_dt = (datetime.utcnow() - timedelta(days=365 * years + 5))
         end_dt   = datetime.utcnow()
         url = (
@@ -209,48 +210,61 @@ def load_ohlcv(symbol: str, years: int) -> pd.DataFrame:
             if len(nse_df) > 0:
                 return nse_df
     except Exception:
-        pass  # proceed to Alpha Vantage
+        pass
 
-    # ---------- C) Alpha Vantage optional (needs key) ----------
-    av_key = st.secrets.get("ALPHAVANTAGE_KEY") if hasattr(st, "secrets") else None
-    if av_key:
+    # ---------- B) Uploaded CSV ----------
+    if uploaded_csv_bytes:
         try:
-            import requests
-            sym = raw.replace(".NS", "").upper()
-            url = ("https://www.alphavantage.co/query"
-                   f"?function=TIME_SERIES_DAILY_ADJUSTED&symbol={sym}.BSE&outputsize=full&apikey={av_key}")
-            r = requests.get(url, timeout=20)
-            js = r.json()
-            ts = js.get("Time Series (Daily)", {})
-            if ts:
-                recs = []
-                cutoff = datetime.utcnow() - timedelta(days=365 * years + 5)
-                for d, v in ts.items():
-                    dt = datetime.strptime(d, "%Y-%m-%d")
-                    if dt < cutoff: continue
-                    recs.append({
-                        "Date": dt,
-                        "Open": float(v["1. open"]),
-                        "High": float(v["2. high"]),
-                        "Low":  float(v["3. low"]),
-                        "Close":float(v["4. close"]),
-                        "Volume":float(v["6. volume"]),
-                    })
-                av_df = pd.DataFrame(recs).set_index("Date").sort_index()
-                if len(av_df) > 0:
-                    return av_df
-        except Exception:
-            pass
+            dfu = pd.read_csv(io.BytesIO(uploaded_csv_bytes))
+            # Try common date column names
+            date_col = None
+            for cand in ["Date", "date", "DATE", "Timestamp", "timestamp"]:
+                if cand in dfu.columns:
+                    date_col = cand; break
+            if date_col is None:
+                raise ValueError("CSV must include a 'Date' column.")
+            dfu[date_col] = pd.to_datetime(dfu[date_col], errors="coerce")
+            dfu = dfu.dropna(subset=[date_col]).set_index(date_col).sort_index()
+            # Normalize column names
+            lo = {c.lower(): c for c in dfu.columns}
+            need = ["open","high","low","close","volume"]
+            missing = [c for c in need if c not in lo]
+            if missing:
+                raise ValueError(f"CSV missing columns: {missing}")
+            out = dfu[[lo["open"], lo["high"], lo["low"], lo["close"], lo["volume"]]].copy()
+            out.columns = ["Open","High","Low","Close","Volume"]
+            out = out.apply(pd.to_numeric, errors="coerce").dropna()
+            if out.empty:
+                raise ValueError("CSV parsed but empty after cleanup.")
+            st.info("Using uploaded CSV as data source.")
+            return out
+        except Exception as e:
+            st.error(f"Uploaded CSV could not be used: {e}")
 
-    # ---------- D) Last safety: backup symbol so app still renders ----------
-    backup = "INFY.NS" if t != "INFY.NS" else "TCS.NS"
-    df = _try(lambda: yf.download(backup, period=f"{years}y", interval="1d",
-                                  auto_adjust=False, progress=False, threads=False))
-    if df is not None and len(df) > 0:
-        st.warning(f"Falling back to {backup} because {raw} failed to load.")
-        return _clean_ohlcv(df)
+    # ---------- C) Demo synthetic (always works, clearly labeled) ----------
+    if allow_demo:
+        # 2 years of business days
+        periods = 252 * years
+        rng = pd.bdate_range(end=pd.Timestamp.utcnow().normalize(), periods=periods)
+        # Geometric Brownian Motion for Close
+        mu, sigma = 0.12, 0.25
+        dt = 1/252
+        close = [2400.0]
+        for _ in range(1, len(rng)):
+            shock = np.random.normal(loc=(mu - 0.5*sigma**2)*dt, scale=sigma*np.sqrt(dt))
+            close.append(close[-1] * np.exp(shock))
+        close = np.array(close)
+        # Build OHLCV around Close
+        high = close * (1 + np.random.uniform(0.002, 0.01, size=len(rng)))
+        low  = close * (1 - np.random.uniform(0.002, 0.01, size=len(rng)))
+        openp = (high + low) / 2 + np.random.uniform(-5, 5, size=len(rng))
+        vol = np.random.randint(2_000_000, 12_000_000, size=len(rng))
+        demo = pd.DataFrame({"Open": openp, "High": high, "Low": low, "Close": close, "Volume": vol}, index=rng)
+        st.warning("All online sources failed — using DEMO synthetic OHLCV so the app remains usable.")
+        return demo
 
-    raise RuntimeError(f"No data returned for {raw} from Yahoo/NSE/AV. Try later or another symbol.")
+    # ---------- D) Give up ----------
+    raise RuntimeError("No data returned from Yahoo/NSE and no CSV provided. Please upload OHLCV CSV in the sidebar.")
 
 
 # -------------------------------
@@ -435,22 +449,39 @@ def plot_roc_small(y_true, prob, title):
 # Sidebar (auto-load; no buttons)
 # -------------------------------
 st.sidebar.header("Configuration")
-ticker = st.sidebar.text_input("Ticker (Yahoo/NSE)", value="RELIANCE.NS")
+# You can also put "RELIANCE" (no suffix) — loader will add .NS
+ticker = st.sidebar.text_input("Ticker (Yahoo/NSE)", value="RELIANCE")
 years = st.sidebar.slider("Years of history", 2, 5, 2)
 use_trend_filter = st.sidebar.checkbox("Trend Filter (SMA50 > SMA200)", value=True)
+
+# --- New: offline/data fallback controls ---
+uploaded_csv = st.sidebar.file_uploader(
+    "Upload OHLCV CSV (Date,Open,High,Low,Close,Volume)", type=["csv"]
+)
+use_demo_if_offline = st.sidebar.toggle(
+    "If network fails, use Demo data", value=True,
+    help="Keeps the app working even if Yahoo/NSE are unreachable."
+)
+
 
 # -------------------------------
 # AUTO LOAD (visible status + cache)
 # -------------------------------
 with st.status("Fetching data…", expanded=False) as s:
     try:
-        df = load_ohlcv(ticker, years)
+        df = load_ohlcv(
+            ticker,
+            years,
+            uploaded_csv.getvalue() if uploaded_csv else None,
+            use_demo_if_offline
+        )
         feat = compute_indicators(df)
         feat = apply_feature_clipping(feat).replace([np.inf, -np.inf], np.nan).dropna()
-        s.update(label=f"✅ Loaded {len(df)} rows for {ticker}", state="complete")
+        s.update(label=f"✅ Loaded {len(df)} rows", state="complete")
     except Exception as e:
         s.update(label=f"❌ Data load failed: {e}", state="error")
         st.stop()
+
 
 data = feat.copy()
 feature_cols = [c for c in data.columns if c != "y"]
